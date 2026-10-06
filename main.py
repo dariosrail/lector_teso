@@ -1,453 +1,684 @@
 """
-Visor MySQL con Flet (web, escritorio y Android) - solo lectura.
-Basado en el visor Tkinter: tablas, datos paginados, búsqueda, orden,
-estructura, detalle de fila, consulta SQL y exportar CSV.
+Consulta de Recibos - H. Ayuntamiento de Telchac Puerto
+Lee la tabla TEARMO01 de MySQL (solo lectura).
 
-- Local:     python main.py
-- Servidor:  usa la variable PORT (Railway la pone sola)
-- Android:   flet build apk
+Variables de entorno (Railway -> Variables):
+  DB_URL    mysql://usuario:contraseña@host:puerto/base   (obligatoria)
+  APP_PIN   clave para entrar (opcional, recomendado)
+  TABLA     nombre de la tabla (opcional, por defecto se busca TEARMO01)
+  DEMO_CSV  ruta a un CSV exportado para probar sin MySQL (opcional)
 
-Variables de entorno (en Railway: pestaña Variables):
-- DB_URL   URL fija de MySQL. Si existe, la app se conecta sola al abrir.
-- APP_PIN  (opcional) clave para entrar a la app.
+Arranque:  python app.py
 """
 import os
+import io
+import re
 import csv
-import time
-import uuid
 import hmac
+import datetime as dt
+from collections import Counter, defaultdict
 from urllib.parse import urlparse, unquote
 
-import flet as ft
-import pymysql
-from pymysql.cursors import DictCursor
-
-PAGE_SIZE = 100          # filas por página en "Datos"
-SQL_MAX_ROWS = 1000      # máximo de filas en la pestaña "SQL"
-CSV_MAX_ROWS = 100000    # máximo de filas al exportar
-ALLOWED = ("select", "show", "describe", "desc", "explain")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-EXPORT_DIR = os.path.join(ASSETS_DIR, "exports")
-os.makedirs(EXPORT_DIR, exist_ok=True)
+from flask import (Flask, request, jsonify, send_file, session, redirect,
+                   render_template_string, url_for)
 
 DB_URL = os.getenv("DB_URL", "").strip()
 APP_PIN = os.getenv("APP_PIN", "").strip()
+TABLA_ENV = os.getenv("TABLA", "").strip()
+DEMO_CSV = os.getenv("DEMO_CSV", "").strip()
+MAX_FILAS = 20000
 
-INK = "#1D3557"
-AMBER = "#E9A23B"
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY") or os.urandom(32)
 
-
-def q(nombre):
-    """Escapa un identificador (tabla/columna) para MySQL."""
-    return "`" + str(nombre).replace("`", "``") + "`"
-
-
-def fmt(valor, max_len=120):
-    if valor is None:
-        return "NULL"
-    if isinstance(valor, (bytes, bytearray)):
-        return f"<binario {len(valor)} bytes>"
-    s = str(valor).replace("\n", " ⏎ ")
-    return s if len(s) <= max_len else s[:max_len] + "…"
+COLUMNAS = ["recibo", "fecha", "hora", "contribuyente", "concepto1", "concepto2",
+            "importe", "descuento", "neto", "formapago", "status", "cuenta",
+            "rfc", "direccion", "observaciones", "reftransfe"]
 
 
+# ------------------------------------------------------------------ utilidades
 def parse_url(url):
-    s = (url or "").strip().strip('"').strip("'").strip()
+    s = (url or "").strip().strip('"').strip("'")
     i = s.find("mysql://")
     if i > 0:
         s = s[i:]
     u = urlparse(s)
-    if u.scheme not in ("mysql", "mysql+pymysql"):
-        raise ValueError("La URL debe empezar con mysql://")
-    if not u.hostname:
-        raise ValueError("Falta el host en la URL")
-    return dict(
-        host=u.hostname,
-        port=u.port or 3306,
-        user=unquote(u.username or "root"),
-        password=unquote(u.password or ""),
-        database=u.path.lstrip("/") or "railway",
-    )
+    if u.scheme not in ("mysql", "mysql+pymysql") or not u.hostname:
+        raise ValueError("DB_URL inválida: debe ser mysql://usuario:contraseña@host:puerto/base")
+    return dict(host=u.hostname, port=u.port or 3306,
+                user=unquote(u.username or "root"),
+                password=unquote(u.password or ""),
+                database=u.path.lstrip("/") or "railway")
 
 
-def limpiar_exportes_viejos(max_edad=3600):
-    ahora = time.time()
-    for f in os.listdir(EXPORT_DIR):
-        ruta = os.path.join(EXPORT_DIR, f)
-        try:
-            if ahora - os.path.getmtime(ruta) > max_edad:
-                os.remove(ruta)
-        except OSError:
-            pass
+def a_yymmdd(iso):
+    d = dt.date.fromisoformat(iso)
+    return d.strftime("%y%m%d")
 
 
-def main(page: ft.Page):
-    page.title = "Visor MySQL"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.theme = ft.Theme(color_scheme_seed=INK)
-    page.padding = 16
+def fecha_txt(yymmdd):
+    s = str(yymmdd or "").strip()
+    if len(s) == 6 and s.isdigit():
+        return f"{s[4:6]}/{s[2:4]}/20{s[0:2]}"
+    return s
 
-    st = dict(conn=None, cfg=None, tabla=None, columnas=[], pagina=0,
-              total=0, filtro="", orden=None)
 
-    # ------------------------------------------------------------ controles
-    url_field = ft.TextField(
-        label="URL de conexión",
-        hint_text="mysql://usuario:contraseña@host:puerto/base",
-        password=True, can_reveal_password=True, expand=True,
-    )
-    connect_btn = ft.FilledButton("Conectar", icon=ft.Icons.POWER)
-    status = ft.Text("Pega tu URL de MySQL y toca Conectar.", size=13)
-    url_row = ft.Row([url_field, connect_btn], visible=not DB_URL,
-                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
+def num(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
-    pin_field = ft.TextField(label="Clave de acceso", password=True,
-                             can_reveal_password=True, expand=True)
-    pin_btn = ft.FilledButton("Entrar", icon=ft.Icons.LOCK_OPEN)
-    pin_row = ft.Row([pin_field, pin_btn], visible=bool(DB_URL and APP_PIN),
-                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-    tablas_dd = ft.Dropdown(label="Tabla", options=[], expand=True, disabled=True)
-    refresh_btn = ft.IconButton(ft.Icons.REFRESH, tooltip="Recargar tablas", disabled=True)
+def forma_pago(v):
+    s = str(v or "").strip().upper()
+    if "EFECTIVO" in s:
+        return "EFECTIVO"
+    if "TRANSF" in s:
+        return "TRANSFERENCIA"
+    if "CHEQUE" in s:
+        return "CHEQUE"
+    if "TARJETA" in s:
+        return "TARJETA"
+    return s or "SIN DATO"
 
-    # Datos
-    buscar_field = ft.TextField(label="Buscar en todas las columnas", expand=True,
-                                dense=True, disabled=True)
-    btn_buscar = ft.IconButton(ft.Icons.SEARCH, tooltip="Buscar", disabled=True)
-    btn_limpiar = ft.IconButton(ft.Icons.CLEAR, tooltip="Limpiar búsqueda", disabled=True)
-    btn_csv = ft.OutlinedButton("Exportar CSV", icon=ft.Icons.DOWNLOAD, disabled=True)
-    btn_prev = ft.IconButton(ft.Icons.CHEVRON_LEFT, tooltip="Anterior", disabled=True)
-    btn_next = ft.IconButton(ft.Icons.CHEVRON_RIGHT, tooltip="Siguiente", disabled=True)
-    lbl_pagina = ft.Text("Selecciona una tabla", size=13)
-    datos_holder = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
 
-    # Estructura
-    estr_holder = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+def etiqueta_concepto(c):
+    c = re.sub(r"\s+No\.?\s*\d+.*$", "", str(c or "").strip(), flags=re.I)
+    return c[:70] or "SIN CONCEPTO"
 
-    # SQL
-    sql_field = ft.TextField(label="Consulta (solo SELECT, SHOW, DESCRIBE, EXPLAIN)",
-                             multiline=True, min_lines=3, max_lines=7,
-                             text_style=ft.TextStyle(font_family="monospace"),
-                             disabled=True)
-    btn_run = ft.FilledButton("Ejecutar", icon=ft.Icons.PLAY_ARROW, disabled=True)
-    lbl_sql = ft.Text("", size=13)
-    sql_holder = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
 
-    def marco(c):
-        return ft.Container(c, expand=True, padding=8, border_radius=6,
-                            border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT))
+def normalizar(r):
+    concepto = str(r.get("concepto1") or "").strip()
+    extra = str(r.get("concepto2") or "").strip()
+    return {
+        "folio": str(r.get("recibo") or "").strip(),
+        "fecha": fecha_txt(r.get("fecha")),
+        "hora": str(r.get("hora") or "").strip(),
+        "contribuyente": str(r.get("contribuyente") or "").strip(),
+        "concepto": concepto,
+        "detalle": extra,
+        "importe": num(r.get("importe")),
+        "descuento": num(r.get("descuento")),
+        "neto": num(r.get("neto")),
+        "forma_pago": forma_pago(r.get("formapago")),
+        "cancelado": str(r.get("status") or "").strip() == "1",
+        "cuenta": str(r.get("cuenta") or "").strip(),
+        "rfc": str(r.get("rfc") or "").strip(),
+        "direccion": str(r.get("direccion") or "").strip(),
+        "observaciones": str(r.get("observaciones") or "").strip(),
+        "referencia": str(r.get("reftransfe") or "").strip(),
+    }
 
-    tabs = ft.Tabs(
-        selected_index=0, expand=True, animation_duration=150,
-        tabs=[
-            ft.Tab(text="Datos", icon=ft.Icons.TABLE_ROWS, content=ft.Container(
-                padding=ft.padding.only(top=8),
-                content=ft.Column(expand=True, horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
-                    ft.Row([buscar_field, btn_buscar, btn_limpiar, btn_csv],
-                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    marco(datos_holder),
-                    ft.Row([btn_prev, lbl_pagina, btn_next,
-                            ft.Text("Toca una fila para ver el detalle · toca un encabezado para ordenar",
-                                    size=12, color=ft.Colors.OUTLINE)],
-                           wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ]))),
-            ft.Tab(text="Estructura", icon=ft.Icons.SCHEMA, content=ft.Container(
-                padding=ft.padding.only(top=8), content=marco(estr_holder))),
-            ft.Tab(text="SQL", icon=ft.Icons.CODE, content=ft.Container(
-                padding=ft.padding.only(top=8),
-                content=ft.Column(expand=True, horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
-                    sql_field,
-                    ft.Row([btn_run, lbl_sql], vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    marco(sql_holder),
-                ]))),
-        ],
-    )
 
-    controles_conexion = [tablas_dd, refresh_btn, buscar_field, btn_buscar,
-                          btn_limpiar, sql_field, btn_run]
+# ------------------------------------------------------------------ datos
+_tabla_cache = {}
 
-    # ------------------------------------------------------------ utilidades
-    def set_status(msg, error=False):
-        status.value = msg
-        status.color = ft.Colors.ERROR if error else None
-        page.update()
 
-    def ejecutar(sql, params=None):
-        conn = st["conn"]
-        if conn is None:
-            raise RuntimeError("No hay conexión activa")
-        conn.ping(reconnect=True)
+def conectar():
+    import pymysql
+    from pymysql.cursors import DictCursor
+    cfg = parse_url(DB_URL)
+    conn = pymysql.connect(**cfg, cursorclass=DictCursor, connect_timeout=15,
+                           read_timeout=90, charset="utf8mb4", autocommit=True)
+    with conn.cursor() as cur:
+        cur.execute("SET SESSION TRANSACTION READ ONLY")
+    return conn
+
+
+def nombre_tabla(conn):
+    if TABLA_ENV:
+        return TABLA_ENV
+    if "t" not in _tabla_cache:
         with conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            if cur.description:
-                return [d[0] for d in cur.description], cur.fetchall()
-            return [], []
+            cur.execute("SELECT TABLE_NAME AS t FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND LOWER(TABLE_NAME) = 'tearmo01'")
+            fila = cur.fetchone()
+        _tabla_cache["t"] = fila["t"] if fila else "TEARMO01"
+    return _tabla_cache["t"]
 
-    def ver_detalle(fila):
-        items = []
-        for k, v in fila.items():
-            if v is None:
-                val = "NULL"
-            elif isinstance(v, (bytes, bytearray)):
-                val = f"<binario {len(v)} bytes>"
-            else:
-                val = str(v)
-            items.append(ft.Text(str(k), weight=ft.FontWeight.BOLD, color=INK))
-            items.append(ft.Text(val, selectable=True))
-            items.append(ft.Container(height=6))
-        dlg = ft.AlertDialog(
-            title=ft.Text("Detalle de fila"),
-            content=ft.Container(ft.Column(items, scroll=ft.ScrollMode.AUTO),
-                                 width=560, height=460),
-            actions=[ft.TextButton("Cerrar", on_click=lambda e: page.close(dlg))],
-        )
-        page.open(dlg)
 
-    def tabla_ui(cols, rows, ordenable=False, detalle=True):
-        if not cols:
-            return ft.Text("La consulta no devolvió columnas.")
-        if not rows:
-            return ft.Text("Sin filas.")
-        sort_idx = None
-        columnas = []
-        for i, c in enumerate(cols):
-            on_sort = (lambda e, c=c: ordenar(c)) if ordenable else None
-            columnas.append(ft.DataColumn(ft.Text(str(c), weight=ft.FontWeight.BOLD),
-                                          on_sort=on_sort))
-            if ordenable and st["orden"] and st["orden"][0] == c:
-                sort_idx = i
-        filas = []
-        for i, r in enumerate(rows):
-            filas.append(ft.DataRow(
-                cells=[ft.DataCell(ft.Text(fmt(r.get(c)))) for c in cols],
-                color=ft.Colors.with_opacity(0.05, INK) if i % 2 else None,
-                on_select_changed=(lambda e, r=r: ver_detalle(r)) if detalle else None,
-            ))
-        dt = ft.DataTable(
-            columns=columnas, rows=filas,
-            sort_column_index=sort_idx,
-            sort_ascending=st["orden"][1] if sort_idx is not None else True,
-            show_checkbox_column=False,
-            heading_row_color=ft.Colors.with_opacity(0.18, AMBER),
-            column_spacing=24, data_row_min_height=34, data_row_max_height=44,
-        )
-        return ft.Row([dt], scroll=ft.ScrollMode.ALWAYS)
+def consultar(desde, hasta, texto):
+    d1, d2 = a_yymmdd(desde), a_yymmdd(hasta)
+    if d1 > d2:
+        d1, d2 = d2, d1
+    texto = (texto or "").strip()
 
-    # ------------------------------------------------------------ conexión
-    def conectar(e=None):
-        conectar_con(DB_URL or url_field.value)
+    if DEMO_CSV:
+        with open(DEMO_CSV, encoding="utf-8-sig", newline="") as f:
+            filas = [r for r in csv.DictReader(f) if d1 <= str(r["fecha"]).strip() <= d2]
+        if texto:
+            t = texto.upper()
+            filas = [r for r in filas if t in r["contribuyente"].upper() or t in r["recibo"]]
+        filas.sort(key=lambda r: (r["fecha"], r["hora"], r["recibo"]))
+        return [normalizar(r) for r in filas[:MAX_FILAS]]
 
-    def entrar_con_pin(e=None):
-        if hmac.compare_digest((pin_field.value or "").strip(), APP_PIN):
-            pin_row.visible = False
-            conectar_con(DB_URL)
-        else:
-            pin_field.value = ""
-            set_status("Clave incorrecta.", error=True)
+    conn = conectar()
+    try:
+        tabla = "`" + nombre_tabla(conn).replace("`", "``") + "`"
+        sql = (f"SELECT {', '.join('`'+c+'`' for c in COLUMNAS)} FROM {tabla} "
+               "WHERE `fecha` BETWEEN %s AND %s")
+        params = [d1, d2]
+        if texto:
+            sql += " AND (`contribuyente` LIKE %s OR `recibo` LIKE %s)"
+            params += [f"%{texto}%", f"%{texto}%"]
+        sql += " ORDER BY `fecha`, `hora`, `recibo` LIMIT %s"
+        params.append(MAX_FILAS)
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [normalizar(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
-    def conectar_con(url):
-        try:
-            cfg = parse_url(url or "")
-        except ValueError as ex:
-            return set_status(str(ex), error=True)
-        set_status("Conectando...")
-        try:
-            if st["conn"]:
-                st["conn"].close()
-            conn = pymysql.connect(**cfg, cursorclass=DictCursor, connect_timeout=15,
-                                   read_timeout=60, charset="utf8mb4", autocommit=True)
-            with conn.cursor() as cur:
-                cur.execute("SET SESSION TRANSACTION READ ONLY")
-            st["conn"], st["cfg"] = conn, cfg
-            for c in controles_conexion:
-                c.disabled = False
-            cargar_tablas()
-        except Exception as ex:
-            st["conn"] = None
-            set_status(f"No se pudo conectar: {ex}", error=True)
 
-    def cargar_tablas(e=None):
-        try:
-            _, rows = ejecutar(
-                "SELECT TABLE_NAME AS t, TABLE_ROWS AS n FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME")
-        except Exception as ex:
-            return set_status(f"Error: {ex}", error=True)
-        tablas_dd.options = [ft.dropdown.Option(key=r["t"], text=f"{r['t']}  (~{r['n'] or 0})")
-                             for r in rows]
-        set_status(f"Conectado · {len(rows)} tablas en '{st['cfg']['database']}'")
+def totales(filas):
+    vig = [f for f in filas if not f["cancelado"]]
+    return {
+        "neto": round(sum(f["neto"] for f in vig), 2),
+        "descuento": round(sum(f["descuento"] for f in vig), 2),
+        "recibos": len(vig),
+        "cancelados": len(filas) - len(vig),
+    }
 
-    # ------------------------------------------------------------ tablas
-    def al_seleccionar_tabla(e):
-        if not tablas_dd.value:
-            return
-        st.update(tabla=tablas_dd.value, pagina=0, filtro="", orden=None)
-        buscar_field.value = ""
-        try:
-            cols, rows = ejecutar(f"DESCRIBE {q(st['tabla'])}")
-            st["columnas"] = [r["Field"] for r in rows]
-            estr_holder.controls = [tabla_ui(cols, rows, detalle=False)]
-        except Exception as ex:
-            return set_status(f"Error: {ex}", error=True)
-        sql_field.value = f"SELECT * FROM {q(st['tabla'])} LIMIT 100"
-        btn_csv.disabled = False
-        cargar_pagina()
 
-    def _where():
-        if not st["filtro"] or not st["columnas"]:
-            return "", []
-        expr = "CONCAT_WS(' ', " + ", ".join(q(c) for c in st["columnas"]) + ")"
-        return f" WHERE {expr} LIKE %s", [f"%{st['filtro']}%"]
+def resumen(filas):
+    vig = [f for f in filas if not f["cancelado"]]
+    por_pago = defaultdict(lambda: {"recibos": 0, "neto": 0.0})
+    por_cuenta = defaultdict(lambda: {"recibos": 0, "neto": 0.0, "nombres": Counter()})
+    for f in vig:
+        p = por_pago[f["forma_pago"]]
+        p["recibos"] += 1
+        p["neto"] += f["neto"]
+        c = por_cuenta[f["cuenta"] or "SIN CUENTA"]
+        c["recibos"] += 1
+        c["neto"] += f["neto"]
+        c["nombres"][etiqueta_concepto(f["concepto"])] += 1
+    pagos = [{"nombre": k, "recibos": v["recibos"], "neto": round(v["neto"], 2)}
+             for k, v in por_pago.items()]
+    conceptos = [{"cuenta": k, "nombre": v["nombres"].most_common(1)[0][0],
+                  "recibos": v["recibos"], "neto": round(v["neto"], 2)}
+                 for k, v in por_cuenta.items()]
+    pagos.sort(key=lambda x: -x["neto"])
+    conceptos.sort(key=lambda x: -x["neto"])
+    return {"pagos": pagos, "conceptos": conceptos, "totales": totales(filas)}
 
-    def _order():
-        if not st["orden"]:
-            return ""
-        col, asc = st["orden"]
-        return f" ORDER BY {q(col)} {'ASC' if asc else 'DESC'}"
 
-    def cargar_pagina():
-        t = st["tabla"]
-        if not t:
-            return
-        where, params = _where()
-        set_status(f"Cargando {t}...")
-        try:
-            _, r = ejecutar(f"SELECT COUNT(*) AS n FROM {q(t)}{where}", params)
-            st["total"] = r[0]["n"]
-            cols, rows = ejecutar(
-                f"SELECT * FROM {q(t)}{where}{_order()} LIMIT %s OFFSET %s",
-                params + [PAGE_SIZE, st["pagina"] * PAGE_SIZE])
-        except Exception as ex:
-            return set_status(f"Error: {ex}", error=True)
-        datos_holder.controls = [tabla_ui(cols or st["columnas"], rows, ordenable=True)]
-        paginas = max(1, -(-st["total"] // PAGE_SIZE))
-        lbl_pagina.value = f"Página {st['pagina'] + 1} de {paginas} · {st['total']} filas"
-        btn_prev.disabled = st["pagina"] == 0
-        btn_next.disabled = (st["pagina"] + 1) * PAGE_SIZE >= st["total"]
-        tabs.selected_index = 0
-        extra = f" (filtro: '{st['filtro']}')" if st["filtro"] else ""
-        set_status(f"{t}: {st['total']} filas{extra}")
+def leer_filtros():
+    hoy = dt.date.today().isoformat()
+    return (request.args.get("desde") or hoy,
+            request.args.get("hasta") or hoy,
+            request.args.get("q") or "")
 
-    def pagina_anterior(e):
-        if st["pagina"] > 0:
-            st["pagina"] -= 1
-            cargar_pagina()
 
-    def pagina_siguiente(e):
-        if (st["pagina"] + 1) * PAGE_SIZE < st["total"]:
-            st["pagina"] += 1
-            cargar_pagina()
+# ------------------------------------------------------------------ acceso
+@app.before_request
+def exigir_pin():
+    if not APP_PIN or request.endpoint in ("login", "static"):
+        return None
+    if session.get("ok"):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="Sesión expirada, vuelve a entrar."), 401
+    return redirect(url_for("login"))
 
-    def ordenar(col):
-        if st["orden"] and st["orden"][0] == col:
-            st["orden"] = (col, not st["orden"][1])
-        else:
-            st["orden"] = (col, True)
-        st["pagina"] = 0
-        cargar_pagina()
 
-    def buscar(e=None):
-        st["filtro"] = (buscar_field.value or "").strip()
-        st["pagina"] = 0
-        cargar_pagina()
+@app.route("/entrar", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        if APP_PIN and hmac.compare_digest(request.form.get("pin", "").strip(), APP_PIN):
+            session["ok"] = True
+            session.permanent = True
+            return redirect(url_for("inicio"))
+        error = "Clave incorrecta."
+    return render_template_string(LOGIN_HTML, error=error, css=CSS)
 
-    def limpiar_busqueda(e):
-        buscar_field.value = ""
-        buscar()
 
-    def exportar_csv(e):
-        t = st["tabla"]
-        if not t:
-            return
-        where, params = _where()
-        set_status("Generando CSV...")
-        try:
-            cols, rows = ejecutar(f"SELECT * FROM {q(t)}{where}{_order()} LIMIT %s",
-                                  params + [CSV_MAX_ROWS])
-            nombre = f"{t}_{uuid.uuid4().hex[:10]}.csv"
-            destino = EXPORT_DIR if page.web else os.path.join(os.path.expanduser("~"), "Downloads")
-            os.makedirs(destino, exist_ok=True)
-            ruta = os.path.join(destino, nombre)
-            with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow(cols)
-                for r in rows:
-                    w.writerow(["" if r[c] is None else r[c] for c in cols])
-        except Exception as ex:
-            return set_status(f"Error al exportar: {ex}", error=True)
-        if page.web:
-            limpiar_exportes_viejos()
-            page.launch_url(f"/exports/{nombre}")
-            set_status(f"CSV listo: {len(rows)} filas (se abre la descarga)")
-        else:
-            set_status(f"Exportadas {len(rows)} filas a {ruta}")
+# ------------------------------------------------------------------ rutas
+@app.route("/")
+def inicio():
+    return render_template_string(PAGE_HTML, css=CSS, configurado=bool(DB_URL or DEMO_CSV))
 
-    # ------------------------------------------------------------ SQL
-    def ejecutar_sql(e):
-        sql = (sql_field.value or "").strip().rstrip(";").strip()
-        if not sql:
-            return
-        primera = sql.split(None, 1)[0].lower()
-        if primera not in ALLOWED or ";" in sql:
-            lbl_sql.value, lbl_sql.color = "Solo una consulta SELECT, SHOW, DESCRIBE o EXPLAIN.", ft.Colors.ERROR
-            return page.update()
-        if primera == "select" and " limit " not in f" {sql.lower()} ":
-            sql += f" LIMIT {SQL_MAX_ROWS + 1}"
-        try:
-            cols, rows = ejecutar(sql)
-        except Exception as ex:
-            lbl_sql.value, lbl_sql.color = f"Error: {ex}", ft.Colors.ERROR
-            return page.update()
-        aviso = ""
-        if len(rows) > SQL_MAX_ROWS:
-            rows = rows[:SQL_MAX_ROWS]
-            aviso = f" (mostrando {SQL_MAX_ROWS})"
-        sql_holder.controls = [tabla_ui(cols, rows)]
-        lbl_sql.value, lbl_sql.color = f"{len(rows)} filas{aviso}", ft.Colors.GREEN_700
-        page.update()
 
-    # ------------------------------------------------------------ eventos
-    connect_btn.on_click = conectar
-    url_field.on_submit = conectar
-    pin_btn.on_click = entrar_con_pin
-    pin_field.on_submit = entrar_con_pin
-    refresh_btn.on_click = cargar_tablas
-    tablas_dd.on_change = al_seleccionar_tabla
-    buscar_field.on_submit = buscar
-    btn_buscar.on_click = buscar
-    btn_limpiar.on_click = limpiar_busqueda
-    btn_csv.on_click = exportar_csv
-    btn_prev.on_click = pagina_anterior
-    btn_next.on_click = pagina_siguiente
-    btn_run.on_click = ejecutar_sql
+@app.route("/api/recibos")
+def api_recibos():
+    try:
+        filas = consultar(*leer_filtros())
+    except Exception as ex:
+        return jsonify(error=f"No se pudo consultar: {ex}"), 500
+    return jsonify(filas=filas, totales=totales(filas), limite=len(filas) >= MAX_FILAS)
 
-    # ------------------------------------------------------------ layout
-    page.add(ft.Column(
-        expand=True,
-        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-        controls=[
-            ft.Text("Visor MySQL", size=24, weight=ft.FontWeight.W_700, color=INK),
-            url_row,
-            pin_row,
-            status,
-            ft.Row([tablas_dd, refresh_btn], vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            tabs,
-        ],
-    ))
 
-    # Conexión automática si la URL está fija en el servidor
-    if DB_URL:
-        if APP_PIN:
-            set_status("Escribe la clave de acceso para entrar.")
-        else:
-            conectar_con(DB_URL)
+@app.route("/api/resumen")
+def api_resumen():
+    try:
+        filas = consultar(*leer_filtros())
+    except Exception as ex:
+        return jsonify(error=f"No se pudo consultar: {ex}"), 500
+    return jsonify(resumen(filas))
+
+
+def nombre_archivo(desde, hasta, ext):
+    return f"recibos_{desde}_a_{hasta}.{ext}"
+
+
+@app.route("/excel")
+def excel():
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    desde, hasta, q = leer_filtros()
+    filas = consultar(desde, hasta, q)
+    t = totales(filas)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recibos"
+    ws["A1"] = "H. Ayuntamiento de Telchac Puerto - Consulta de Recibos"
+    ws["A1"].font = Font(bold=True, size=14, color="6D1F35")
+    ws["A2"] = f"Del {fecha_txt(a_yymmdd(desde))} al {fecha_txt(a_yymmdd(hasta))}" + (f"  ·  Contribuyente: {q}" if q else "")
+    ws["A3"] = (f"Total neto: ${t['neto']:,.2f}   Descuento: ${t['descuento']:,.2f}   "
+                f"Recibos: {t['recibos']}   Cancelados: {t['cancelados']}")
+
+    enc = ["Folio", "Fecha", "Hora", "Contribuyente", "Concepto", "Detalle", "Importe",
+           "Descuento", "Neto", "Forma de pago", "Estado", "Cuenta", "RFC", "Observaciones"]
+    ws.append([])
+    ws.append(enc)
+    fila_enc = ws.max_row
+    for c in ws[fila_enc]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="6D1F35")
+        c.alignment = Alignment(vertical="center")
+    rojo = Font(color="C0392B")
+    for f in filas:
+        ws.append([f["folio"], f["fecha"], f["hora"], f["contribuyente"], f["concepto"],
+                   f["detalle"], f["importe"], f["descuento"], f["neto"], f["forma_pago"],
+                   "CANCELADO" if f["cancelado"] else "VIGENTE", f["cuenta"], f["rfc"],
+                   f["observaciones"]])
+        if f["cancelado"]:
+            for c in ws[ws.max_row]:
+                c.font = rojo
+    for col in (7, 8, 9):
+        for c in ws.iter_rows(min_row=fila_enc + 1, min_col=col, max_col=col):
+            c[0].number_format = '"$"#,##0.00'
+    anchos = [9, 11, 9, 40, 45, 30, 12, 12, 12, 15, 12, 15, 15, 30]
+    for i, w in enumerate(anchos, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = ws.cell(row=fila_enc + 1, column=1)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=nombre_archivo(desde, hasta, "xlsx"),
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/pdf")
+def pdf():
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+
+    desde, hasta, q = leer_filtros()
+    filas = consultar(desde, hasta, q)
+    t = totales(filas)
+
+    vino = colors.HexColor("#6D1F35")
+    oro = colors.HexColor("#C29B5B")
+    st_t = ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=15, textColor=vino, leading=18)
+    st_s = ParagraphStyle("s", fontName="Helvetica", fontSize=9.5, leading=13)
+    st_c = ParagraphStyle("c", fontName="Helvetica", fontSize=7.5, leading=9)
+    st_cr = ParagraphStyle("cr", parent=st_c, textColor=colors.HexColor("#C0392B"))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(letter), leftMargin=1.2 * cm,
+                            rightMargin=1.2 * cm, topMargin=1.2 * cm, bottomMargin=1.2 * cm,
+                            title="Consulta de Recibos")
+    periodo = f"Del {fecha_txt(a_yymmdd(desde))} al {fecha_txt(a_yymmdd(hasta))}"
+    if q:
+        periodo += f" · Contribuyente: {escape(q)}"
+    story = [
+        Paragraph("H. Ayuntamiento de Telchac Puerto · Consulta de Recibos", st_t),
+        Paragraph(periodo, st_s),
+        Paragraph(f"<b>Total neto: ${t['neto']:,.2f}</b> &nbsp;&nbsp; Descuento: ${t['descuento']:,.2f}"
+                  f" &nbsp;&nbsp; Recibos: {t['recibos']} &nbsp;&nbsp; "
+                  f"<font color='#C0392B'>Cancelados: {t['cancelados']}</font>", st_s),
+        Spacer(1, 8),
+    ]
+    data = [["Folio", "Fecha", "Contribuyente", "Concepto", "Neto", "Forma de pago", "Descuento"]]
+    estilos = [
+        ("BACKGROUND", (0, 0), (-1, 0), vino),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (4, 1), (4, -1), "RIGHT"),
+        ("ALIGN", (6, 1), (6, -1), "RIGHT"),
+        ("LINEBELOW", (0, 0), (-1, 0), 1.2, oro),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6F3F0")]),
+    ]
+    for i, f in enumerate(filas, 1):
+        ps = st_cr if f["cancelado"] else st_c
+        concepto = escape(f["concepto"]) + (" <b>(CANCELADO)</b>" if f["cancelado"] else "")
+        data.append([f["folio"], f["fecha"], Paragraph(escape(f["contribuyente"]), ps),
+                     Paragraph(concepto, ps), f"${f['neto']:,.2f}", f["forma_pago"],
+                     f"${f['descuento']:,.2f}"])
+        if f["cancelado"]:
+            estilos.append(("TEXTCOLOR", (0, i), (-1, i), colors.HexColor("#C0392B")))
+    if not filas:
+        data.append(["", "", "Sin recibos en este periodo", "", "", "", ""])
+    tabla = Table(data, repeatRows=1,
+                  colWidths=[1.6 * cm, 2 * cm, 6.8 * cm, 8.6 * cm, 2.4 * cm, 2.8 * cm, 2.2 * cm])
+    tabla.setStyle(TableStyle(estilos))
+    story.append(tabla)
+
+    def pie(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.grey)
+        canvas.drawRightString(landscape(letter)[0] - 1.2 * cm, 0.7 * cm,
+                               f"Página {doc_.page} · generado {dt.datetime.now():%d/%m/%Y %H:%M}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=pie, onLaterPages=pie)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=nombre_archivo(desde, hasta, "pdf"),
+                     mimetype="application/pdf")
+
+
+# ------------------------------------------------------------------ HTML
+CSS = """
+:root{
+  --vino:#6D1F35; --vino-osc:#521627; --oro:#C29B5B; --verde:#12332C;
+  --fondo:#F2F1EF; --tinta:#2A2326; --gris:#6F6669; --linea:#E3DEDA; --rojo:#C0392B; --ok:#1E8A55;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font-family:"Source Sans 3","Segoe UI",Roboto,Arial,sans-serif;background:var(--fondo);color:var(--tinta);font-size:16px}
+h1,h2,h3,.marca{font-family:"Montserrat","Segoe UI",Arial,sans-serif}
+.ancho{max-width:1120px;margin:0 auto;padding:0 20px}
+header.top{background:#fff;border-top:4px solid var(--verde);border-bottom:3px solid var(--oro)}
+header.top .ancho{display:flex;align-items:center;justify-content:space-between;min-height:82px;gap:16px}
+.marca{display:flex;align-items:center;gap:14px;text-decoration:none}
+.escudo{width:44px;height:44px;border-radius:50%;background:var(--vino);color:#fff;display:grid;place-items:center;font-weight:800;font-size:15px;border:2px solid var(--oro)}
+.marca b{display:block;color:var(--vino);font-size:19px;letter-spacing:.06em}
+.marca small{display:block;color:var(--gris);font-size:11.5px;font-weight:700;letter-spacing:.08em;margin-top:2px}
+nav a{color:var(--tinta);text-decoration:none;font-weight:600;font-size:14px;margin-left:28px;padding-bottom:4px}
+nav a.activo{border-bottom:2px solid var(--vino);color:var(--vino)}
+.banda{background:var(--vino);border-bottom:4px solid var(--oro);color:#fff;padding:26px 0 30px}
+.banda h1{margin:0 0 16px;font-weight:500;font-size:30px}
+.filtros{display:grid;grid-template-columns:170px 170px 1fr auto auto auto;gap:14px;align-items:end}
+.filtros label{display:block;font-size:14px;opacity:.9;margin-bottom:5px}
+.filtros input{width:100%;height:42px;border:0;border-radius:3px;padding:0 12px;font:inherit;font-size:17px;color:var(--tinta)}
+.btn{height:42px;border:0;border-radius:4px;padding:0 24px;font:inherit;font-weight:700;font-size:17px;cursor:pointer;white-space:nowrap}
+.btn:focus-visible,.filtros input:focus-visible,.vista button:focus-visible{outline:3px solid var(--oro);outline-offset:2px}
+.btn-buscar{background:var(--verde);color:#fff}
+.btn-resumen{background:var(--oro);color:#fff}
+.btn-hoy{background:transparent;color:#fff;border:1.5px solid #fff;font-weight:500}
+.btn:hover{filter:brightness(1.08)}
+main{padding:26px 0 50px}
+.totales{background:#fff;border-left:5px solid var(--oro);border-radius:4px;padding:18px 20px;box-shadow:0 1px 3px rgba(60,20,30,.07)}
+.totales .neto{font-size:22px}
+.totales .neto span{color:var(--ok)}
+.totales .desc{font-size:17px;margin-top:6px}
+.totales .cuentas{font-size:14px;color:var(--gris);margin-top:8px}
+.totales .cuentas .canc{color:var(--rojo)}
+.barra{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin:20px 0 16px;flex-wrap:wrap}
+.vista{display:inline-flex;border:1px solid #bdb5b1;border-radius:4px;overflow:hidden}
+.vista button{background:#fff;border:0;padding:7px 14px;font:inherit;font-size:14px;cursor:pointer;color:var(--gris)}
+.vista button+button{border-left:1px solid #bdb5b1}
+.vista button.on{background:#EDE6E1;color:var(--tinta);font-weight:600}
+.btn-desc{height:auto;min-height:52px;padding:6px 18px;font-size:15px;font-weight:600;background:#fff;line-height:1.25}
+.btn-xls{border:1.5px solid var(--ok);color:var(--ok)}
+.btn-pdf{border:1.5px solid var(--rojo);color:var(--rojo)}
+.mensaje{padding:28px;text-align:center;color:var(--gris)}
+.mensaje.error{color:var(--rojo)}
+.tabla-wrap{overflow-x:auto;background:#fff;border-left:4px solid var(--oro);border-radius:4px;box-shadow:0 1px 3px rgba(60,20,30,.07)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th{text-align:left;font-size:12.5px;font-weight:700;letter-spacing:.03em;padding:12px 10px;white-space:nowrap;border-bottom:2px solid var(--linea);position:sticky;top:0;background:#fff}
+td{padding:10px;border-bottom:1px solid var(--linea);vertical-align:top}
+td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+tr.fila{cursor:pointer}
+tr.fila:hover td{background:#FAF6F3}
+tr.cancelado td{color:var(--rojo);text-decoration:line-through;text-decoration-thickness:1px}
+tr.cancelado td.estado{text-decoration:none}
+.tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:3px;background:#FBE9E7;color:var(--rojo);text-decoration:none}
+.tarjetas{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.tarjeta{background:#fff;border-radius:4px;padding:14px 16px;border-top:3px solid var(--vino);box-shadow:0 1px 3px rgba(60,20,30,.07);cursor:pointer}
+.tarjeta.cancelado{border-top-color:var(--rojo);opacity:.85}
+.tarjeta .arriba{display:flex;justify-content:space-between;font-size:13px;color:var(--gris)}
+.tarjeta .nombre{font-weight:700;margin:6px 0 4px;line-height:1.25}
+.tarjeta .concepto{font-size:13.5px;color:var(--gris);line-height:1.3}
+.tarjeta .abajo{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px}
+.tarjeta .monto{font-size:20px;font-weight:700;color:var(--ok);font-variant-numeric:tabular-nums}
+.tarjeta.cancelado .monto{color:var(--rojo);text-decoration:line-through}
+.tarjeta .pago{font-size:12px;color:var(--gris)}
+dialog{border:0;border-radius:6px;padding:0;max-width:720px;width:calc(100% - 32px);box-shadow:0 10px 40px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(30,10,15,.45)}
+.dlg-cab{background:var(--vino);color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid var(--oro)}
+.dlg-cab h2{margin:0;font-size:19px;font-weight:600}
+.dlg-cab button{background:none;border:0;color:#fff;font-size:26px;cursor:pointer;line-height:1}
+.dlg-cuerpo{padding:18px 20px;max-height:70vh;overflow:auto}
+.dlg-cuerpo h3{font-size:15px;color:var(--vino);margin:18px 0 8px}
+.dlg-cuerpo h3:first-child{margin-top:0}
+.det{display:grid;grid-template-columns:140px 1fr;gap:6px 14px;font-size:14.5px}
+.det dt{color:var(--gris)}
+.det dd{margin:0;word-break:break-word}
+.login{min-height:100vh;display:grid;place-items:center;background:var(--vino)}
+.login form{background:#fff;padding:28px;border-radius:6px;border-top:4px solid var(--oro);width:min(360px,92vw)}
+.login h1{font-size:20px;color:var(--vino);margin:0 0 14px}
+.login input{width:100%;height:44px;border:1px solid #ccc;border-radius:4px;padding:0 12px;font-size:17px;margin-bottom:12px}
+@media (max-width:900px){
+  .filtros{grid-template-columns:1fr 1fr}
+  .filtros .campo-texto{grid-column:1/-1}
+  .filtros .btn{width:100%}
+  .filtros .btn-hoy{grid-column:1/-1}
+  nav a{margin-left:16px}
+  .banda h1{font-size:25px}
+}
+@media (max-width:520px){
+  .marca small{display:none}
+  nav{display:none}
+  .barra{display:grid;grid-template-columns:1fr 1fr}
+  .barra .lbl-vista{display:none}
+  .barra .vista{grid-column:1/-1}
+  .barra .vista button{flex:1;padding:10px}
+  .det{grid-template-columns:1fr}
+  .det dt{font-weight:700;color:var(--vino)}
+}
+"""
+
+FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+         '<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800'
+         '&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">')
+
+LOGIN_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entrar · Consulta de Recibos</title>""" + FONTS + """<style>{{ css|safe }}</style></head>
+<body><div class="login"><form method="post">
+<h1>Consulta de Recibos</h1>
+<input type="password" name="pin" placeholder="Clave de acceso" autofocus required>
+{% if error %}<p style="color:var(--rojo);margin:0 0 12px">{{ error }}</p>{% endif %}
+<button class="btn btn-buscar" style="width:100%">Entrar</button>
+</form></div></body></html>"""
+
+PAGE_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consulta de Recibos · Telchac Puerto</title>""" + FONTS + """<style>{{ css|safe }}</style></head>
+<body>
+<header class="top"><div class="ancho">
+  <a class="marca" href="/"><div class="escudo">TP</div>
+    <div><b>TELCHAC PUERTO</b><small>H. AYUNTAMIENTO</small></div></a>
+  <nav><a class="activo" href="/">RECIBOS</a></nav>
+</div></header>
+
+<section class="banda"><div class="ancho">
+  <h1>Consulta de Recibos</h1>
+  <form class="filtros" id="filtros">
+    <div><label for="desde">Desde:</label><input type="date" id="desde" required></div>
+    <div><label for="hasta">Hasta:</label><input type="date" id="hasta" required></div>
+    <div class="campo-texto"><label for="q">Contribuyente o folio:</label>
+      <input type="text" id="q" placeholder="Nombre opcional..." autocomplete="off"></div>
+    <button class="btn btn-buscar" type="submit">Buscar</button>
+    <button class="btn btn-resumen" type="button" id="btnResumen">Resumen</button>
+    <button class="btn btn-hoy" type="button" id="btnHoy">Ir a Hoy</button>
+  </form>
+</div></section>
+
+<main><div class="ancho">
+  <div class="totales" aria-live="polite">
+    <div class="neto">Total Neto: <span id="tNeto">$0.00</span></div>
+    <div class="desc">Total Descuento: <span id="tDesc">$0.00</span></div>
+    <div class="cuentas">Recibos: <span id="tRec">0</span> | <span class="canc">Cancelados: <span id="tCan">0</span></span></div>
+  </div>
+
+  <div class="barra">
+    <span class="lbl-vista" style="color:var(--gris);font-size:15px">Vista en:</span>
+    <div class="vista" role="group" aria-label="Tipo de vista">
+      <button type="button" id="vTarjetas">Tarjetas</button><button type="button" id="vTabla" class="on">Tabla</button>
+    </div>
+    <button class="btn btn-desc btn-xls" type="button" id="btnExcel">Descargar<br>EXCEL</button>
+    <button class="btn btn-desc btn-pdf" type="button" id="btnPdf">Descargar<br>PDF</button>
+  </div>
+
+  <div id="resultados"></div>
+</div></main>
+
+<dialog id="dlg"><div class="dlg-cab"><h2 id="dlgTitulo"></h2>
+  <button type="button" aria-label="Cerrar" onclick="dlg.close()">×</button></div>
+  <div class="dlg-cuerpo" id="dlgCuerpo"></div></dialog>
+
+<script>
+const CONFIGURADO = {{ 'true' if configurado else 'false' }};
+const $ = id => document.getElementById(id);
+const dlg = $("dlg");
+let filas = [], vista = "tabla";
+
+const dinero = n => "$" + Number(n || 0).toLocaleString("es-MX", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const hoyISO = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
+const params = () => new URLSearchParams({desde: $("desde").value, hasta: $("hasta").value, q: $("q").value.trim()});
+
+function mensaje(txt, error) {
+  $("resultados").innerHTML = `<div class="mensaje${error ? " error" : ""}">${esc(txt)}</div>`;
+}
+
+async function pedir(url) {
+  const r = await fetch(url);
+  if (r.status === 401) { location.href = "/entrar"; throw new Error("Sesión expirada"); }
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "Error al consultar");
+  return data;
+}
+
+async function buscar() {
+  if (!CONFIGURADO) return mensaje("Falta configurar la variable DB_URL en Railway.", true);
+  mensaje("Buscando recibos...");
+  try {
+    const data = await pedir("/api/recibos?" + params());
+    filas = data.filas;
+    const t = data.totales;
+    $("tNeto").textContent = dinero(t.neto);
+    $("tDesc").textContent = dinero(t.descuento);
+    $("tRec").textContent = t.recibos;
+    $("tCan").textContent = t.cancelados;
+    pintar();
+    if (data.limite) $("resultados").insertAdjacentHTML("afterbegin",
+      '<div class="mensaje">Se muestran los primeros 20,000 recibos. Acorta el rango de fechas para ver todos.</div>');
+  } catch (e) { mensaje(e.message, true); }
+}
+
+function pintar() {
+  if (!filas.length) return mensaje("No hay recibos en este periodo. Cambia las fechas y toca Buscar.");
+  if (vista === "tabla") {
+    $("resultados").innerHTML = `<div class="tabla-wrap"><table><thead><tr>
+      <th>FOLIO</th><th>FECHA</th><th>CONTRIBUYENTE</th><th>CONCEPTO</th>
+      <th style="text-align:right">MONTO NETO</th><th>FORMA DE PAGO</th><th style="text-align:right">DESCUENTO</th></tr></thead><tbody>` +
+      filas.map((f, i) => `<tr class="fila${f.cancelado ? " cancelado" : ""}" data-i="${i}">
+        <td>${esc(f.folio)}</td><td>${esc(f.fecha)}</td><td>${esc(f.contribuyente)}</td>
+        <td>${esc(f.concepto)}${f.cancelado ? ' <span class="tag estado">CANCELADO</span>' : ""}</td>
+        <td class="num">${dinero(f.neto)}</td><td>${esc(f.forma_pago)}</td><td class="num">${dinero(f.descuento)}</td></tr>`).join("") +
+      "</tbody></table></div>";
+  } else {
+    $("resultados").innerHTML = '<div class="tarjetas">' + filas.map((f, i) => `
+      <div class="tarjeta${f.cancelado ? " cancelado" : ""}" data-i="${i}" tabindex="0">
+        <div class="arriba"><span>Folio ${esc(f.folio)}</span><span>${esc(f.fecha)} ${esc(f.hora)}</span></div>
+        <div class="nombre">${esc(f.contribuyente)}</div>
+        <div class="concepto">${esc(f.concepto)}</div>
+        <div class="abajo"><span class="monto">${dinero(f.neto)}</span>
+          <span class="pago">${f.cancelado ? '<span class="tag">CANCELADO</span>' : esc(f.forma_pago)}</span></div>
+      </div>`).join("") + "</div>";
+  }
+}
+
+function verDetalle(f) {
+  const campos = [["Folio", f.folio], ["Fecha", f.fecha + " " + f.hora], ["Estado", f.cancelado ? "CANCELADO" : "Vigente"],
+    ["Contribuyente", f.contribuyente], ["RFC", f.rfc], ["Dirección", f.direccion], ["Concepto", f.concepto],
+    ["Detalle", f.detalle], ["Importe", dinero(f.importe)], ["Descuento", dinero(f.descuento)], ["Neto", dinero(f.neto)],
+    ["Forma de pago", f.forma_pago], ["Referencia", f.referencia], ["Cuenta", f.cuenta], ["Observaciones", f.observaciones]];
+  $("dlgTitulo").textContent = "Recibo " + f.folio;
+  $("dlgCuerpo").innerHTML = '<dl class="det">' + campos.filter(c => c[1] && String(c[1]).trim())
+    .map(c => `<dt>${esc(c[0])}</dt><dd>${esc(c[1])}</dd>`).join("") + "</dl>";
+  dlg.showModal();
+}
+
+async function verResumen() {
+  if (!CONFIGURADO) return mensaje("Falta configurar la variable DB_URL en Railway.", true);
+  $("dlgTitulo").textContent = "Resumen del periodo";
+  $("dlgCuerpo").innerHTML = '<div class="mensaje">Calculando...</div>';
+  dlg.showModal();
+  try {
+    const r = await pedir("/api/resumen?" + params());
+    const tabla = (enc, items, fn) => `<div class="tabla-wrap"><table><thead><tr>${enc}</tr></thead><tbody>${items.map(fn).join("")}</tbody></table></div>`;
+    $("dlgCuerpo").innerHTML = `
+      <h3>Total neto ${dinero(r.totales.neto)} · ${r.totales.recibos} recibos · ${r.totales.cancelados} cancelados</h3>
+      <h3>Por forma de pago</h3>` +
+      tabla('<th>FORMA DE PAGO</th><th style="text-align:right">RECIBOS</th><th style="text-align:right">NETO</th>', r.pagos,
+        p => `<tr><td>${esc(p.nombre)}</td><td class="num">${p.recibos}</td><td class="num">${dinero(p.neto)}</td></tr>`) +
+      "<h3>Por concepto (cuenta)</h3>" +
+      tabla('<th>CUENTA</th><th>CONCEPTO</th><th style="text-align:right">RECIBOS</th><th style="text-align:right">NETO</th>', r.conceptos,
+        c => `<tr><td>${esc(c.cuenta)}</td><td>${esc(c.nombre)}</td><td class="num">${c.recibos}</td><td class="num">${dinero(c.neto)}</td></tr>`);
+    if (!r.pagos.length) $("dlgCuerpo").innerHTML = '<div class="mensaje">No hay recibos vigentes en este periodo.</div>';
+  } catch (e) { $("dlgCuerpo").innerHTML = `<div class="mensaje error">${esc(e.message)}</div>`; }
+}
+
+function cambiarVista(v) {
+  vista = v;
+  $("vTabla").classList.toggle("on", v === "tabla");
+  $("vTarjetas").classList.toggle("on", v === "tarjetas");
+  if (filas.length) pintar();
+}
+
+$("filtros").addEventListener("submit", e => { e.preventDefault(); buscar(); });
+$("btnHoy").onclick = () => { $("desde").value = $("hasta").value = hoyISO(); buscar(); };
+$("btnResumen").onclick = verResumen;
+$("vTabla").onclick = () => cambiarVista("tabla");
+$("vTarjetas").onclick = () => cambiarVista("tarjetas");
+$("btnExcel").onclick = () => { location.href = "/excel?" + params(); };
+$("btnPdf").onclick = () => { location.href = "/pdf?" + params(); };
+$("resultados").addEventListener("click", e => {
+  const el = e.target.closest("[data-i]"); if (el) verDetalle(filas[+el.dataset.i]);
+});
+$("resultados").addEventListener("keydown", e => {
+  const el = e.target.closest("[data-i]"); if (el && e.key === "Enter") verDetalle(filas[+el.dataset.i]);
+});
+
+$("desde").value = $("hasta").value = hoyISO();
+if (window.innerWidth < 700) cambiarVista("tarjetas");
+buscar();
+</script>
+</body></html>"""
 
 
 if __name__ == "__main__":
-    port = os.getenv("PORT")
-    if port:
-        ft.app(target=main, view=None, host="0.0.0.0", port=int(port), assets_dir=ASSETS_DIR)
-    else:
-        ft.app(target=main, assets_dir=ASSETS_DIR)
+    port = int(os.getenv("PORT", "8080"))
+    try:
+        from waitress import serve
+        print(f"Sirviendo en http://0.0.0.0:{port}")
+        serve(app, host="0.0.0.0", port=port, threads=8)
+    except ImportError:
+        app.run(host="0.0.0.0", port=port)
