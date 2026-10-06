@@ -4,7 +4,13 @@ Lee la tabla TEARMO01 de MySQL (solo lectura).
 
 Variables de entorno (Railway -> Variables):
   DB_URL    mysql://usuario:contraseña@host:puerto/base   (obligatoria)
-  APP_PIN   clave para entrar (opcional, recomendado)
+  USUARIOS  usuarios con clave, uno por línea o separados por ;  (recomendado)
+            formato:  numero|NOMBRE|clave
+            ej.:      01|ALFONZO NUÑEZ|1111;02|MANUEL NUÑEZ|2222;03|SISTEMAS|3333
+  PUEDEN_CANCELAR  números de usuario que pueden cancelar recibos (por defecto 01,02)
+  NIP_FACTOR       multiplicador del NIP de cancelación (por defecto 9)
+  APP_PIN   una sola clave general (solo si no usas USUARIOS)
+  SECRET_KEY  (opcional) para que las sesiones no se cierren al redesplegar
   TABLA     nombre de la tabla (opcional, por defecto se busca TEARMO01)
   DEMO_CSV  ruta a un CSV exportado para probar sin MySQL (opcional)
 
@@ -15,6 +21,7 @@ import io
 import re
 import csv
 import hmac
+import time
 import datetime as dt
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, unquote
@@ -27,11 +34,38 @@ APP_PIN = os.getenv("APP_PIN", "").strip()
 TABLA_ENV = os.getenv("TABLA", "").strip()
 DEMO_CSV = os.getenv("DEMO_CSV", "").strip()
 MAX_FILAS = 20000
+MAX_INTENTOS = 5          # intentos fallidos antes de bloquear
+BLOQUEO_SEG = 5 * 60      # minutos de bloqueo
+
+
+def cargar_usuarios():
+    usuarios = {}
+    crudo = os.getenv("USUARIOS", "").replace("\r", "")
+    for parte in re.split(r"[;\n]+", crudo):
+        campos = [c.strip() for c in parte.split("|")]
+        if len(campos) == 3 and all(campos):
+            usuarios[campos[0]] = {"nombre": campos[1], "clave": campos[2]}
+    return usuarios
+
+
+USUARIOS = cargar_usuarios()
+PUEDEN_CANCELAR = {x.strip() for x in os.getenv("PUEDEN_CANCELAR", "01,02").split(",") if x.strip()}
+_demo_cancelados = set()
+NIP_FACTOR = int(os.getenv("NIP_FACTOR", "9") or 9)
+
+
+def nip_cancelacion(recibo, importe):
+    """(número de recibo sin letras + importe entero sin centavos) * factor"""
+    digitos = re.sub(r"\D", "", str(recibo or "")) or "0"
+    return (int(digitos) + int(num(importe))) * NIP_FACTOR
+_intentos = {}
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY") or os.urandom(32)
+app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SECURE=bool(os.getenv("RAILWAY_ENVIRONMENT")))
 
-COLUMNAS = ["recibo", "fecha", "hora", "contribuyente", "concepto1", "concepto2",
+COLUMNAS = ["id", "recibo", "fecha", "hora", "contribuyente", "concepto1", "concepto2",
             "importe", "descuento", "neto", "formapago", "status", "cuenta",
             "rfc", "direccion", "observaciones", "reftransfe"]
 
@@ -91,7 +125,11 @@ def etiqueta_concepto(c):
 def normalizar(r):
     concepto = str(r.get("concepto1") or "").strip()
     extra = str(r.get("concepto2") or "").strip()
+    cancelado = str(r.get("status") or "").strip() == "1"
+    if DEMO_CSV and str(r.get("id")) in _demo_cancelados:
+        cancelado = True
     return {
+        "id": str(r.get("id") or "").strip(),
         "folio": str(r.get("recibo") or "").strip(),
         "fecha": fecha_txt(r.get("fecha")),
         "hora": str(r.get("hora") or "").strip(),
@@ -102,7 +140,7 @@ def normalizar(r):
         "descuento": num(r.get("descuento")),
         "neto": num(r.get("neto")),
         "forma_pago": forma_pago(r.get("formapago")),
-        "cancelado": str(r.get("status") or "").strip() == "1",
+        "cancelado": cancelado,
         "cuenta": str(r.get("cuenta") or "").strip(),
         "rfc": str(r.get("rfc") or "").strip(),
         "direccion": str(r.get("direccion") or "").strip(),
@@ -115,14 +153,15 @@ def normalizar(r):
 _tabla_cache = {}
 
 
-def conectar():
+def conectar(escritura=False):
     import pymysql
     from pymysql.cursors import DictCursor
     cfg = parse_url(DB_URL)
     conn = pymysql.connect(**cfg, cursorclass=DictCursor, connect_timeout=15,
-                           read_timeout=90, charset="utf8mb4", autocommit=True)
-    with conn.cursor() as cur:
-        cur.execute("SET SESSION TRANSACTION READ ONLY")
+                           read_timeout=90, charset="utf8mb4", autocommit=not escritura)
+    if not escritura:
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION TRANSACTION READ ONLY")
     return conn
 
 
@@ -171,6 +210,91 @@ def consultar(desde, hasta, texto):
         conn.close()
 
 
+def buscar_folio(folio):
+    folio = (folio or "").strip()
+    if not folio:
+        return []
+    if DEMO_CSV:
+        with open(DEMO_CSV, encoding="utf-8-sig", newline="") as f:
+            todas = list(csv.DictReader(f))
+        filas = [r for r in todas if r["recibo"].strip().upper() == folio.upper()]
+        if not filas:
+            filas = [r for r in todas if r["recibo"].strip().upper().endswith(folio.upper())][:10]
+        return [normalizar(r) for r in filas]
+    conn = conectar()
+    try:
+        tabla = "`" + nombre_tabla(conn).replace("`", "``") + "`"
+        cols = ", ".join("`" + c + "`" for c in COLUMNAS)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {cols} FROM {tabla} WHERE `recibo` = %s ORDER BY `fecha` DESC LIMIT 10", [folio])
+            filas = cur.fetchall()
+            if not filas:
+                cur.execute(f"SELECT {cols} FROM {tabla} WHERE `recibo` LIKE %s ORDER BY `fecha` DESC LIMIT 10",
+                            [f"%{folio}"])
+                filas = cur.fetchall()
+        return [normalizar(r) for r in filas]
+    finally:
+        conn.close()
+
+
+def nip_valido(nip_escrito, recibo, importe):
+    escrito = re.sub(r"\D", "", str(nip_escrito or ""))
+    return bool(escrito) and hmac.compare_digest(escrito, str(nip_cancelacion(recibo, importe)))
+
+
+def cancelar_recibo(id_recibo, usuario, motivo, ip, nip):
+    """Valida el NIP, marca el recibo como cancelado (status = 1) y lo registra en cancelaciones_web.
+    Regresa (ok, mensaje, nip_incorrecto)."""
+    if DEMO_CSV:
+        with open(DEMO_CSV, encoding="utf-8-sig", newline="") as f:
+            r = next((x for x in csv.DictReader(f) if str(x["id"]) == str(id_recibo)), None)
+        if not r:
+            return False, "No se encontró el recibo.", False
+        if not nip_valido(nip, r["recibo"], r["importe"]):
+            return False, "NIP de cancelación incorrecto.", True
+        _demo_cancelados.add(str(id_recibo))
+        return True, "Recibo cancelado (modo demo).", False
+    conn = conectar(escritura=True)
+    try:
+        tabla = "`" + nombre_tabla(conn).replace("`", "``") + "`"
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS `cancelaciones_web` (
+                `id` INT AUTO_INCREMENT PRIMARY KEY,
+                `recibo_id` VARCHAR(30) NOT NULL,
+                `folio` VARCHAR(30),
+                `contribuyente` VARCHAR(255),
+                `neto` DECIMAL(14,2),
+                `usuario` VARCHAR(100),
+                `motivo` VARCHAR(255),
+                `ip` VARCHAR(64),
+                `fecha` DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+            conn.commit()
+            cur.execute(f"SELECT `id`, `recibo`, `contribuyente`, `importe`, `neto`, `status` FROM {tabla} "
+                        "WHERE `id` = %s FOR UPDATE", [id_recibo])
+            r = cur.fetchone()
+            if not r:
+                conn.rollback()
+                return False, "No se encontró el recibo.", False
+            if str(r["status"]).strip() == "1":
+                conn.rollback()
+                return False, "Ese recibo ya estaba cancelado.", False
+            if not nip_valido(nip, r["recibo"], r["importe"]):
+                conn.rollback()
+                return False, "NIP de cancelación incorrecto.", True
+            cur.execute(f"UPDATE {tabla} SET `status` = %s WHERE `id` = %s", ["1", id_recibo])
+            cur.execute("INSERT INTO `cancelaciones_web` (`recibo_id`, `folio`, `contribuyente`, `neto`, "
+                        "`usuario`, `motivo`, `ip`) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        [str(r["id"]), str(r["recibo"]), str(r["contribuyente"])[:255],
+                         num(r["neto"]), usuario, (motivo or "")[:255], ip])
+        conn.commit()
+        return True, "Recibo cancelado.", False
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def totales(filas):
     vig = [f for f in filas if not f["cancelado"]]
     return {
@@ -211,11 +335,15 @@ def leer_filtros():
 
 
 # ------------------------------------------------------------------ acceso
+def ip_cliente():
+    return (request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0]).strip()
+
+
 @app.before_request
-def exigir_pin():
-    if not APP_PIN or request.endpoint in ("login", "static"):
+def exigir_login():
+    if not (USUARIOS or APP_PIN) or request.endpoint in ("login", "static"):
         return None
-    if session.get("ok"):
+    if session.get("usuario"):
         return None
     if request.path.startswith("/api/"):
         return jsonify(error="Sesión expirada, vuelve a entrar."), 401
@@ -224,20 +352,109 @@ def exigir_pin():
 
 @app.route("/entrar", methods=["GET", "POST"])
 def login():
+    if not (USUARIOS or APP_PIN):
+        return redirect(url_for("inicio"))
     error = ""
+    elegido = ""
     if request.method == "POST":
-        if APP_PIN and hmac.compare_digest(request.form.get("pin", "").strip(), APP_PIN):
-            session["ok"] = True
-            session.permanent = True
-            return redirect(url_for("inicio"))
-        error = "Clave incorrecta."
-    return render_template_string(LOGIN_HTML, error=error, css=CSS)
+        elegido = request.form.get("usuario", "").strip()
+        clave = request.form.get("clave", "").strip()
+        llave = (ip_cliente(), elegido)
+        n, hasta = _intentos.get(llave, (0, 0))
+        if hasta > time.time():
+            mins = int((hasta - time.time()) // 60) + 1
+            error = f"Demasiados intentos. Espera {mins} min y vuelve a intentar."
+        else:
+            if USUARIOS:
+                u = USUARIOS.get(elegido)
+                ok = bool(u) and hmac.compare_digest(clave, u["clave"])
+                datos = {"num": elegido, "nombre": u["nombre"]} if ok else None
+            else:
+                ok = hmac.compare_digest(clave, APP_PIN)
+                datos = {"num": "", "nombre": ""} if ok else None
+            if ok:
+                _intentos.pop(llave, None)
+                session.clear()
+                session["usuario"] = datos
+                session.permanent = True
+                print(f"[acceso] OK usuario={elegido} ip={ip_cliente()}", flush=True)
+                return redirect(url_for("inicio"))
+            n += 1
+            _intentos[llave] = (n, time.time() + BLOQUEO_SEG if n >= MAX_INTENTOS else 0)
+            print(f"[acceso] FALLÓ usuario={elegido} ip={ip_cliente()} intento={n}", flush=True)
+            error = "Usuario o clave incorrecta."
+            if n >= MAX_INTENTOS:
+                error = "Demasiados intentos. Espera 5 min y vuelve a intentar."
+    lista = [(k, v["nombre"]) for k, v in sorted(USUARIOS.items())]
+    return render_template_string(LOGIN_HTML, error=error, css=CSS, usuarios=lista, elegido=elegido)
+
+
+@app.route("/salir")
+def salir():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+def usuario_actual():
+    u = session.get("usuario") or {}
+    return u.get("nombre", "")
+
+
+def puede_cancelar():
+    u = session.get("usuario") or {}
+    return bool(USUARIOS) and u.get("num") in PUEDEN_CANCELAR
+
+
+@app.route("/api/folio")
+def api_folio():
+    if not puede_cancelar():
+        return jsonify(error="No tienes permiso para cancelar recibos."), 403
+    try:
+        return jsonify(filas=buscar_folio(request.args.get("folio", "")))
+    except Exception as ex:
+        return jsonify(error=f"No se pudo buscar: {ex}"), 500
+
+
+@app.route("/api/cancelar", methods=["POST"])
+def api_cancelar():
+    if not puede_cancelar():
+        return jsonify(error="No tienes permiso para cancelar recibos."), 403
+    if request.headers.get("X-Requested-With") != "fetch" or not request.is_json:
+        return jsonify(error="Solicitud no válida."), 400
+    datos = request.get_json(silent=True) or {}
+    id_recibo = str(datos.get("id", "")).strip()
+    if not id_recibo:
+        return jsonify(error="Falta el recibo."), 400
+    u = session.get("usuario") or {}
+    quien = f"{u.get('num', '')} {u.get('nombre', '')}".strip()
+    llave = ("nip", u.get("num", ""))
+    n, hasta = _intentos.get(llave, (0, 0))
+    if hasta > time.time():
+        mins = int((hasta - time.time()) // 60) + 1
+        return jsonify(error=f"Demasiados NIP incorrectos. Espera {mins} min.", nip=True), 429
+    try:
+        ok, msg, nip_mal = cancelar_recibo(id_recibo, quien, str(datos.get("motivo", "")).strip(),
+                                           ip_cliente(), str(datos.get("nip", "")))
+    except Exception as ex:
+        return jsonify(error=f"No se pudo cancelar: {ex}"), 500
+    if nip_mal:
+        n += 1
+        _intentos[llave] = (n, time.time() + BLOQUEO_SEG if n >= MAX_INTENTOS else 0)
+        if n >= MAX_INTENTOS:
+            msg = "Demasiados NIP incorrectos. Espera 5 min."
+    elif ok:
+        _intentos.pop(llave, None)
+    print(f"[cancelacion] {'OK' if ok else 'NO'} recibo_id={id_recibo} usuario={quien} ip={ip_cliente()} msg={msg}",
+          flush=True)
+    return (jsonify(ok=True, mensaje=msg) if ok else (jsonify(error=msg, nip=nip_mal), 409))
 
 
 # ------------------------------------------------------------------ rutas
 @app.route("/")
 def inicio():
-    return render_template_string(PAGE_HTML, css=CSS, configurado=bool(DB_URL or DEMO_CSV))
+    return render_template_string(PAGE_HTML, css=CSS, configurado=bool(DB_URL or DEMO_CSV),
+                                  usuario=usuario_actual(), con_login=bool(USUARIOS or APP_PIN),
+                                  puede_cancelar=puede_cancelar())
 
 
 @app.route("/api/recibos")
@@ -279,7 +496,8 @@ def excel():
     ws["A1"].font = Font(bold=True, size=14, color="6D1F35")
     ws["A2"] = f"Del {fecha_txt(a_yymmdd(desde))} al {fecha_txt(a_yymmdd(hasta))}" + (f"  ·  Contribuyente: {q}" if q else "")
     ws["A3"] = (f"Total neto: ${t['neto']:,.2f}   Descuento: ${t['descuento']:,.2f}   "
-                f"Recibos: {t['recibos']}   Cancelados: {t['cancelados']}")
+                f"Recibos: {t['recibos']}   Cancelados: {t['cancelados']}"
+                + (f"   ·   Generado por: {usuario_actual()}" if usuario_actual() else ""))
 
     enc = ["Folio", "Fecha", "Hora", "Contribuyente", "Concepto", "Detalle", "Importe",
            "Descuento", "Neto", "Forma de pago", "Estado", "Cuenta", "RFC", "Observaciones"]
@@ -376,12 +594,15 @@ def pdf():
     tabla.setStyle(TableStyle(estilos))
     story.append(tabla)
 
+    quien = usuario_actual()
+
     def pie(canvas, doc_):
         canvas.saveState()
         canvas.setFont("Helvetica", 7.5)
         canvas.setFillColor(colors.grey)
         canvas.drawRightString(landscape(letter)[0] - 1.2 * cm, 0.7 * cm,
-                               f"Página {doc_.page} · generado {dt.datetime.now():%d/%m/%Y %H:%M}")
+                               f"Página {doc_.page} · generado {dt.datetime.now():%d/%m/%Y %H:%M}"
+                               + (f" por {quien}" if quien else ""))
         canvas.restoreState()
 
     doc.build(story, onFirstPage=pie, onLaterPages=pie)
@@ -471,7 +692,24 @@ dialog::backdrop{background:rgba(30,10,15,.45)}
 .login{min-height:100vh;display:grid;place-items:center;background:var(--vino)}
 .login form{background:#fff;padding:28px;border-radius:6px;border-top:4px solid var(--oro);width:min(360px,92vw)}
 .login h1{font-size:20px;color:var(--vino);margin:0 0 14px}
-.login input{width:100%;height:44px;border:1px solid #ccc;border-radius:4px;padding:0 12px;font-size:17px;margin-bottom:12px}
+.login label{display:block;font-size:14px;color:var(--gris);margin-bottom:5px}
+.login input,.login select{width:100%;height:44px;border:1px solid #ccc;border-radius:4px;padding:0 12px;font:inherit;font-size:17px;margin-bottom:14px;background:#fff}
+.login .sub{color:var(--gris);font-size:14px;margin:-8px 0 18px}
+.sesion{display:flex;align-items:center;gap:14px;font-size:14px}
+.sesion .quien{color:var(--gris)}
+.sesion .quien b{color:var(--tinta)}
+.btn-cancelar-rec{background:#fff;color:var(--rojo);border:1.5px solid var(--rojo);border-radius:4px;padding:5px 12px;font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+.btn-cancelar-rec:hover{background:#FBE9E7}
+.form-folio{display:flex;gap:10px;margin-bottom:14px}
+.form-folio input,.campo-motivo{flex:1;height:42px;border:1px solid #ccc;border-radius:4px;padding:0 12px;font:inherit;font-size:17px;width:100%}
+.opcion-folio{display:block;width:100%;text-align:left;background:#fff;border:1px solid var(--linea);border-radius:4px;padding:10px 12px;margin-bottom:8px;font:inherit;cursor:pointer}
+.opcion-folio:hover{border-color:var(--vino)}
+.acciones{display:flex;gap:10px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}
+.btn-rojo{background:var(--rojo);color:#fff}
+.btn-gris{background:#E6E1DE;color:var(--tinta)}
+.aviso-confirma{background:#FBE9E7;border-left:4px solid var(--rojo);padding:14px 16px;border-radius:4px;font-size:16px;line-height:1.45}
+.ok-msg{background:#E7F5EC;border-left:4px solid var(--ok);padding:14px 16px;border-radius:4px;color:#145C38}
+.sesion a.salir{color:var(--vino);font-weight:600;text-decoration:none;border:1px solid var(--vino);border-radius:4px;padding:5px 12px}
 @media (max-width:900px){
   .filtros{grid-template-columns:1fr 1fr}
   .filtros .campo-texto{grid-column:1/-1}
@@ -483,6 +721,7 @@ dialog::backdrop{background:rgba(30,10,15,.45)}
 @media (max-width:520px){
   .marca small{display:none}
   nav{display:none}
+  .sesion .quien{display:none}
   .barra{display:grid;grid-template-columns:1fr 1fr}
   .barra .lbl-vista{display:none}
   .barra .vista{grid-column:1/-1}
@@ -499,9 +738,20 @@ FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
 LOGIN_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Entrar · Consulta de Recibos</title>""" + FONTS + """<style>{{ css|safe }}</style></head>
-<body><div class="login"><form method="post">
+<body><div class="login"><form method="post" autocomplete="off">
 <h1>Consulta de Recibos</h1>
-<input type="password" name="pin" placeholder="Clave de acceso" autofocus required>
+<p class="sub">H. Ayuntamiento de Telchac Puerto</p>
+{% if usuarios %}
+<label for="usuario">Usuario</label>
+<select id="usuario" name="usuario" required>
+  <option value="" disabled {% if not elegido %}selected{% endif %}>Elige tu usuario</option>
+  {% for num, nombre in usuarios %}
+  <option value="{{ num }}" {% if num == elegido %}selected{% endif %}>{{ num }} · {{ nombre }}</option>
+  {% endfor %}
+</select>
+{% endif %}
+<label for="clave">Clave</label>
+<input type="password" id="clave" name="clave" inputmode="numeric" required {% if not usuarios or elegido %}autofocus{% endif %}>
 {% if error %}<p style="color:var(--rojo);margin:0 0 12px">{{ error }}</p>{% endif %}
 <button class="btn btn-buscar" style="width:100%">Entrar</button>
 </form></div></body></html>"""
@@ -513,7 +763,14 @@ PAGE_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <header class="top"><div class="ancho">
   <a class="marca" href="/"><div class="escudo">TP</div>
     <div><b>TELCHAC PUERTO</b><small>H. AYUNTAMIENTO</small></div></a>
-  <nav><a class="activo" href="/">RECIBOS</a></nav>
+  <div class="sesion">
+    <nav><a class="activo" href="/">RECIBOS</a></nav>
+    {% if puede_cancelar %}<button type="button" class="btn-cancelar-rec" id="btnCancelarRec">Cancelar recibo</button>{% endif %}
+    {% if con_login %}
+      {% if usuario %}<span class="quien">Usuario: <b>{{ usuario }}</b></span>{% endif %}
+      <a class="salir" href="/salir">Salir</a>
+    {% endif %}
+  </div>
 </div></header>
 
 <section class="banda"><div class="ancho">
@@ -554,6 +811,7 @@ PAGE_HTML = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 
 <script>
 const CONFIGURADO = {{ 'true' if configurado else 'false' }};
+const PUEDE_CANCELAR = {{ 'true' if puede_cancelar else 'false' }};
 const $ = id => document.getElementById(id);
 const dlg = $("dlg");
 let filas = [], vista = "tabla";
@@ -666,6 +924,94 @@ $("resultados").addEventListener("click", e => {
 $("resultados").addEventListener("keydown", e => {
   const el = e.target.closest("[data-i]"); if (el && e.key === "Enter") verDetalle(filas[+el.dataset.i]);
 });
+
+// ---------------- Cancelar recibo
+let recSel = null;
+function datosRecibo(f) {
+  return '<dl class="det">' + [["Folio", f.folio], ["Fecha", f.fecha + " " + f.hora],
+    ["Contribuyente", f.contribuyente], ["Concepto", f.concepto], ["Neto", dinero(f.neto)],
+    ["Forma de pago", f.forma_pago], ["Estado", f.cancelado ? "CANCELADO" : "Vigente"]]
+    .map(c => `<dt>${esc(c[0])}</dt><dd>${esc(c[1])}</dd>`).join("") + "</dl>";
+}
+function abrirCancelar() {
+  recSel = null;
+  $("dlgTitulo").textContent = "Cancelar recibo";
+  $("dlgCuerpo").innerHTML = `<form class="form-folio" id="fFolio">
+      <input id="inFolio" placeholder="Escribe el folio, ej. J00849" autocomplete="off" required>
+      <button class="btn btn-buscar" type="submit">Buscar</button></form>
+    <div id="cancelRes"></div>`;
+  dlg.showModal();
+  $("inFolio").focus();
+  $("fFolio").onsubmit = async e => {
+    e.preventDefault();
+    $("cancelRes").innerHTML = '<div class="mensaje">Buscando...</div>';
+    try {
+      const r = await pedir("/api/folio?folio=" + encodeURIComponent($("inFolio").value.trim()));
+      if (!r.filas.length) return $("cancelRes").innerHTML = '<div class="mensaje">No se encontró ningún recibo con ese folio.</div>';
+      if (r.filas.length === 1) return mostrarRecibo(r.filas[0]);
+      $("cancelRes").innerHTML = "<p>Se encontraron varios recibos, elige uno:</p>" + r.filas.map((f, i) =>
+        `<button type="button" class="opcion-folio" data-k="${i}"><b>${esc(f.folio)}</b> · ${esc(f.fecha)} · ${esc(f.contribuyente)} · ${dinero(f.neto)}${f.cancelado ? " · CANCELADO" : ""}</button>`).join("");
+      $("cancelRes").querySelectorAll(".opcion-folio").forEach(b => b.onclick = () => mostrarRecibo(r.filas[+b.dataset.k]));
+    } catch (err) { $("cancelRes").innerHTML = `<div class="mensaje error">${esc(err.message)}</div>`; }
+  };
+}
+function mostrarRecibo(f) {
+  recSel = f;
+  if (f.cancelado) {
+    $("cancelRes").innerHTML = datosRecibo(f) + '<div class="aviso-confirma" style="margin-top:14px">Este recibo ya está cancelado.</div>';
+    return;
+  }
+  $("cancelRes").innerHTML = datosRecibo(f) + `
+    <label style="display:block;margin:14px 0 5px;color:var(--gris);font-size:14px" for="motivo">Motivo (opcional)</label>
+    <input class="campo-motivo" id="motivo" maxlength="255" placeholder="Ej. error en el monto">
+    <div class="acciones"><button type="button" class="btn btn-rojo" id="btnPreCancelar">Cancelar recibo</button></div>`;
+  $("btnPreCancelar").onclick = confirmarCancelar;
+}
+function confirmarCancelar() {
+  const f = recSel, motivo = $("motivo").value.trim();
+  $("cancelRes").innerHTML = `<div class="aviso-confirma">¿Seguro que desea cancelar el recibo <b>${esc(f.folio)}</b>
+      de <b>${esc(f.contribuyente)}</b> por <b>${dinero(f.neto)}</b>?<br>Esta acción no se puede deshacer desde aquí.</div>
+    <label style="display:block;margin:14px 0 5px;color:var(--gris);font-size:14px" for="nip">NIP de cancelación</label>
+    <input class="campo-motivo" id="nip" type="password" inputmode="numeric" autocomplete="off" placeholder="Escribe el NIP">
+    <div id="nipError" class="mensaje error" style="padding:8px 0 0;text-align:left"></div>
+    <div class="acciones"><button type="button" class="btn btn-gris" id="btnNo">No</button>
+      <button type="button" class="btn btn-rojo" id="btnSi">Sí, cancelar</button></div>`;
+  $("nip").focus();
+  $("nip").onkeydown = e => { if (e.key === "Enter") $("btnSi").click(); };
+  $("btnNo").onclick = () => mostrarRecibo(f);
+  $("btnSi").onclick = async () => {
+    const nip = $("nip").value.trim();
+    if (!nip) { $("nipError").textContent = "Escribe el NIP de cancelación."; return $("nip").focus(); }
+    $("btnSi").disabled = $("btnNo").disabled = true;
+    $("btnSi").textContent = "Cancelando...";
+    $("nipError").textContent = "";
+    try {
+      const r = await fetch("/api/cancelar", {method: "POST",
+        headers: {"Content-Type": "application/json", "X-Requested-With": "fetch"},
+        body: JSON.stringify({id: f.id, motivo, nip})});
+      if (r.status === 401) { location.href = "/entrar"; return; }
+      const d = await r.json();
+      if (!r.ok) {
+        if (d.nip) {
+          $("nipError").textContent = d.error;
+          $("nip").value = ""; $("nip").focus();
+          $("btnSi").disabled = $("btnNo").disabled = false;
+          $("btnSi").textContent = "Sí, cancelar";
+          return;
+        }
+        throw new Error(d.error || "No se pudo cancelar");
+      }
+      $("cancelRes").innerHTML = `<div class="ok-msg">El recibo <b>${esc(f.folio)}</b> quedó cancelado.</div>
+        <div class="acciones"><button type="button" class="btn btn-gris" onclick="dlg.close()">Cerrar</button>
+        <button type="button" class="btn btn-buscar" id="btnOtro">Cancelar otro</button></div>`;
+      $("btnOtro").onclick = abrirCancelar;
+      buscar();
+    } catch (err) {
+      $("cancelRes").innerHTML = `<div class="mensaje error">${esc(err.message)}</div>`;
+    }
+  };
+}
+if (PUEDE_CANCELAR) $("btnCancelarRec").onclick = abrirCancelar;
 
 $("desde").value = $("hasta").value = hoyISO();
 if (window.innerWidth < 700) cambiarVista("tarjetas");
