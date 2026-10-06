@@ -6,11 +6,16 @@ estructura, detalle de fila, consulta SQL y exportar CSV.
 - Local:     python main.py
 - Servidor:  usa la variable PORT (Railway la pone sola)
 - Android:   flet build apk
+
+Variables de entorno (en Railway: pestaña Variables):
+- DB_URL   URL fija de MySQL. Si existe, la app se conecta sola al abrir.
+- APP_PIN  (opcional) clave para entrar a la app.
 """
 import os
 import csv
 import time
 import uuid
+import hmac
 from urllib.parse import urlparse, unquote
 
 import flet as ft
@@ -26,6 +31,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 EXPORT_DIR = os.path.join(ASSETS_DIR, "exports")
 os.makedirs(EXPORT_DIR, exist_ok=True)
+
+DB_URL = os.getenv("DB_URL", "").strip()
+APP_PIN = os.getenv("APP_PIN", "").strip()
 
 INK = "#1D3557"
 AMBER = "#E9A23B"
@@ -46,7 +54,11 @@ def fmt(valor, max_len=120):
 
 
 def parse_url(url):
-    u = urlparse(url.strip())
+    s = (url or "").strip().strip('"').strip("'").strip()
+    i = s.find("mysql://")
+    if i > 0:
+        s = s[i:]
+    u = urlparse(s)
     if u.scheme not in ("mysql", "mysql+pymysql"):
         raise ValueError("La URL debe empezar con mysql://")
     if not u.hostname:
@@ -88,6 +100,14 @@ def main(page: ft.Page):
     )
     connect_btn = ft.FilledButton("Conectar", icon=ft.Icons.POWER)
     status = ft.Text("Pega tu URL de MySQL y toca Conectar.", size=13)
+    url_row = ft.Row([url_field, connect_btn], visible=not DB_URL,
+                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+    pin_field = ft.TextField(label="Clave de acceso", password=True,
+                             can_reveal_password=True, expand=True)
+    pin_btn = ft.FilledButton("Entrar", icon=ft.Icons.LOCK_OPEN)
+    pin_row = ft.Row([pin_field, pin_btn], visible=bool(DB_URL and APP_PIN),
+                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     tablas_dd = ft.Dropdown(label="Tabla", options=[], expand=True, disabled=True)
     refresh_btn = ft.IconButton(ft.Icons.REFRESH, tooltip="Recargar tablas", disabled=True)
@@ -124,7 +144,7 @@ def main(page: ft.Page):
         tabs=[
             ft.Tab(text="Datos", icon=ft.Icons.TABLE_ROWS, content=ft.Container(
                 padding=ft.padding.only(top=8),
-                content=ft.Column(expand=True, controls=[
+                content=ft.Column(expand=True, horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
                     ft.Row([buscar_field, btn_buscar, btn_limpiar, btn_csv],
                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     marco(datos_holder),
@@ -137,7 +157,7 @@ def main(page: ft.Page):
                 padding=ft.padding.only(top=8), content=marco(estr_holder))),
             ft.Tab(text="SQL", icon=ft.Icons.CODE, content=ft.Container(
                 padding=ft.padding.only(top=8),
-                content=ft.Column(expand=True, controls=[
+                content=ft.Column(expand=True, horizontal_alignment=ft.CrossAxisAlignment.STRETCH, controls=[
                     sql_field,
                     ft.Row([btn_run, lbl_sql], vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     marco(sql_holder),
@@ -216,9 +236,20 @@ def main(page: ft.Page):
         return ft.Row([dt], scroll=ft.ScrollMode.ALWAYS)
 
     # ------------------------------------------------------------ conexión
-    def conectar(e):
+    def conectar(e=None):
+        conectar_con(DB_URL or url_field.value)
+
+    def entrar_con_pin(e=None):
+        if hmac.compare_digest((pin_field.value or "").strip(), APP_PIN):
+            pin_row.visible = False
+            conectar_con(DB_URL)
+        else:
+            pin_field.value = ""
+            set_status("Clave incorrecta.", error=True)
+
+    def conectar_con(url):
         try:
-            cfg = parse_url(url_field.value or "")
+            cfg = parse_url(url or "")
         except ValueError as ex:
             return set_status(str(ex), error=True)
         set_status("Conectando...")
@@ -380,6 +411,8 @@ def main(page: ft.Page):
     # ------------------------------------------------------------ eventos
     connect_btn.on_click = conectar
     url_field.on_submit = conectar
+    pin_btn.on_click = entrar_con_pin
+    pin_field.on_submit = entrar_con_pin
     refresh_btn.on_click = cargar_tablas
     tablas_dd.on_change = al_seleccionar_tabla
     buscar_field.on_submit = buscar
@@ -396,12 +429,20 @@ def main(page: ft.Page):
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         controls=[
             ft.Text("Visor MySQL", size=24, weight=ft.FontWeight.W_700, color=INK),
-            ft.Row([url_field, connect_btn], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            url_row,
+            pin_row,
             status,
             ft.Row([tablas_dd, refresh_btn], vertical_alignment=ft.CrossAxisAlignment.CENTER),
             tabs,
         ],
     ))
+
+    # Conexión automática si la URL está fija en el servidor
+    if DB_URL:
+        if APP_PIN:
+            set_status("Escribe la clave de acceso para entrar.")
+        else:
+            conectar_con(DB_URL)
 
 
 if __name__ == "__main__":
