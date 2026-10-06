@@ -963,48 +963,32 @@ function abrirCancelar() {
     } catch (err) { $("cancelRes").innerHTML = `<div class="mensaje error">${esc(err.message)}</div>`; }
   };
 }
-function mostrarRecibo(f) {
+async function mostrarRecibo(f) {
   recSel = f;
   if (f.cancelado) {
     $("cancelRes").innerHTML = datosRecibo(f) + '<div class="aviso-confirma" style="margin-top:14px">Este recibo ya está cancelado.</div>';
     return;
   }
-  $("cancelRes").innerHTML = datosRecibo(f) + `
-    <label style="display:block;margin:14px 0 5px;color:var(--gris);font-size:14px" for="motivo">Motivo (opcional)</label>
-    <input class="campo-motivo" id="motivo" maxlength="255" placeholder="Ej. error en el monto">
-    <div class="acciones"><button type="button" class="btn btn-rojo" id="btnPreCancelar">Cancelar recibo</button></div>`;
-  $("btnPreCancelar").onclick = confirmarCancelar;
-}
-function confirmarCancelar() {
-  const f = recSel, motivo = $("motivo").value.trim();
-  $("cancelRes").innerHTML = `<div class="aviso-confirma">¿Seguro que desea cancelar el recibo <b>${esc(f.folio)}</b>
-      de <b>${esc(f.contribuyente)}</b> por <b>${dinero(f.neto)}</b>?</div>
-    <div class="acciones"><button type="button" class="btn btn-gris" id="btnNo">No</button>
-      <button type="button" class="btn btn-rojo" id="btnSi">Sí, cancelar</button></div>`;
-  $("btnNo").onclick = () => mostrarRecibo(f);
-  $("btnSi").onclick = async () => {
-    $("btnSi").disabled = $("btnNo").disabled = true;
-    $("btnSi").textContent = "Generando NIP...";
-    try {
-      const r = await fetch("/api/nip", {method: "POST",
-        headers: {"Content-Type": "application/json", "X-Requested-With": "fetch"},
-        body: JSON.stringify({id: f.id, motivo})});
-      if (r.status === 401) { location.href = "/entrar"; return; }
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || "No se pudo generar el NIP");
-      $("cancelRes").innerHTML = `<div class="nip-caja">
-          <div class="nip-tit">NIP de cancelación</div>
-          <div class="nip-num">${esc(d.nip)}</div>
-          <div class="nip-sub">Recibo <b>${esc(f.folio)}</b> · ${esc(f.contribuyente)} · ${dinero(f.neto)}</div>
-        </div>
-        <p style="margin:14px 0 0;color:var(--gris)">Dale este NIP a la persona de tesorería que va a cancelar el recibo en caja.</p>
-        <div class="acciones"><button type="button" class="btn btn-gris" onclick="dlg.close()">Cerrar</button>
-        <button type="button" class="btn btn-buscar" id="btnOtro">Otro recibo</button></div>`;
-      $("btnOtro").onclick = abrirCancelar;
-    } catch (err) {
-      $("cancelRes").innerHTML = `<div class="mensaje error">${esc(err.message)}</div>`;
-    }
-  };
+  $("cancelRes").innerHTML = datosRecibo(f) + '<div class="mensaje">Generando NIP...</div>';
+  try {
+    const r = await fetch("/api/nip", {method: "POST",
+      headers: {"Content-Type": "application/json", "X-Requested-With": "fetch"},
+      body: JSON.stringify({id: f.id})});
+    if (r.status === 401) { location.href = "/entrar"; return; }
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "No se pudo generar el NIP");
+    $("cancelRes").innerHTML = datosRecibo(f) + `
+      <div class="nip-caja" style="margin-top:14px">
+        <div class="nip-tit">NIP de cancelación</div>
+        <div class="nip-num">${esc(d.nip)}</div>
+      </div>
+      <p style="margin:12px 0 0;color:var(--gris)">Dale este NIP a la persona de tesorería que va a cancelar el recibo en caja.</p>
+      <div class="acciones"><button type="button" class="btn btn-gris" onclick="dlg.close()">Cerrar</button>
+      <button type="button" class="btn btn-buscar" id="btnOtro">Otro recibo</button></div>`;
+    $("btnOtro").onclick = abrirCancelar;
+  } catch (err) {
+    $("cancelRes").innerHTML = datosRecibo(f) + `<div class="mensaje error">${esc(err.message)}</div>`;
+  }
 }
 if (PUEDE_CANCELAR) $("btnCancelarRec").onclick = abrirCancelar;
 
