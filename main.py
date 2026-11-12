@@ -1,6 +1,6 @@
 """
 Consulta de Recibos - H. Ayuntamiento de Telchac Puerto
-Lee la tabla TEARMO01 de MySQL (solo lectura).
+Lee la tabla TEARMO01 de MySQL (solo lectura).g
 
 Variables de entorno (Railway -> Variables):
   DB_URL    mysql://usuario:contraseña@host:puerto/base   (obligatoria)
